@@ -5,14 +5,25 @@ repo-map.py — структурная карта кодовой базы для
 Извлекает классы, функции, методы из исходного кода и генерирует
 wiki/architecture/repo-map.md с адаптивной детализацией (система шестерён).
 
-Поддерживаемые языки: Python, Java, Go, Kotlin, XML (Spring/Camel).
-Работает без внешних зависимостей — только стандартная библиотека Python.
+Поддерживаемые языки:
+  Tree-sitter (если установлен): TypeScript, TSX, JavaScript, Rust, C#, Swift,
+    Ruby, C, C++, Scala, PHP, Dart, Kotlin, Go, Python, Java, Bash, SQL,
+    JSON, Lua, Groovy, Astro, Vue, Svelte и другие (31+ язык).
+  Regex-fallback (без зависимостей): Python, Java, Go, Kotlin, XML (Spring/Camel).
+
+Установка tree-sitter (опционально):
+  pip install tree-sitter tree-sitter-python tree-sitter-typescript \\
+      tree-sitter-javascript tree-sitter-rust tree-sitter-c-sharp \\
+      tree-sitter-go tree-sitter-java tree-sitter-kotlin tree-sitter-ruby \\
+      tree-sitter-swift tree-sitter-c tree-sitter-cpp tree-sitter-scala \\
+      tree-sitter-php tree-sitter-dart
 
 Использование:
   python scripts/repo-map.py                        # автоопределение из sources.md
   python scripts/repo-map.py src/                   # явный путь
   python scripts/repo-map.py src/ --gear 2          # принудительная шестерня
   python scripts/repo-map.py src/ --incremental     # инкрементальный режим (по mtime)
+  python scripts/repo-map.py src/ --no-ast          # принудительно regex (без tree-sitter)
   python scripts/repo-map.py src/ --output wiki/architecture/repo-map.md
 """
 
@@ -28,6 +39,164 @@ from collections import defaultdict
 
 
 # ─────────────────────────────────────────
+# TREE-SITTER ПОДДЕРЖКА (опциональная)
+# ─────────────────────────────────────────
+# Проверяем наличие tree-sitter при импорте.
+# Если пакеты не установлены — тихо переходим на regex-парсеры.
+# Установка: pip install tree-sitter tree-sitter-python tree-sitter-typescript ...
+
+def _try_import_treesitter() -> bool:
+    """Возвращает True если tree-sitter доступен."""
+    try:
+        import tree_sitter  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+_TREESITTER_AVAILABLE = _try_import_treesitter()
+
+# Маппинг расширений → название грамматики tree-sitter
+# Порядок: сначала расширения, для которых нет regex-fallback
+_TS_LANG_MAP: dict[str, str] = {
+    '.ts':    'typescript',
+    '.tsx':   'tsx',
+    '.js':    'javascript',
+    '.jsx':   'javascript',
+    '.mjs':   'javascript',
+    '.rs':    'rust',
+    '.cs':    'c_sharp',
+    '.swift': 'swift',
+    '.rb':    'ruby',
+    '.c':     'c',
+    '.h':     'c',
+    '.cpp':   'cpp',
+    '.cc':    'cpp',
+    '.cxx':   'cpp',
+    '.scala': 'scala',
+    '.php':   'php',
+    '.dart':  'dart',
+    '.lua':   'lua',
+    # Языки, для которых есть и regex, и tree-sitter:
+    '.py':    'python',
+    '.java':  'java',
+    '.kt':    'kotlin',
+    '.go':    'go',
+}
+
+# Кэш загруженных грамматик (избегаем повторного импорта)
+_TS_LANG_CACHE: dict[str, object] = {}
+
+
+def _load_ts_language(lang_name: str):
+    """Загружает Language из tree-sitter-<lang> пакета. Возвращает None если нет пакета."""
+    if lang_name in _TS_LANG_CACHE:
+        return _TS_LANG_CACHE[lang_name]
+    try:
+        import importlib
+        # tree-sitter пакеты называются tree_sitter_<lang>
+        pkg_name = f'tree_sitter_{lang_name}'
+        mod = importlib.import_module(pkg_name)
+        from tree_sitter import Language
+        lang = Language(mod.language())
+        _TS_LANG_CACHE[lang_name] = lang
+        return lang
+    except Exception:
+        _TS_LANG_CACHE[lang_name] = None
+        return None
+
+
+def _ts_node_text(node, source: bytes) -> str:
+    return source[node.start_byte:node.end_byte].decode('utf-8', errors='replace')
+
+
+def _collect_ts_items(node, source: bytes, gear: int, results: list, depth: int = 0):
+    """Рекурсивный обход AST — универсальный для большинства языков."""
+    # Типы узлов, которые нас интересуют как «контейнеры» (классы, интерфейсы и т.п.)
+    CONTAINER_TYPES = {
+        'class_declaration', 'class_definition', 'class_specifier',
+        'interface_declaration', 'interface_body',
+        'struct_item', 'struct_declaration', 'struct_specifier',
+        'enum_declaration', 'enum_item',
+        'trait_item', 'impl_item',
+        'object_declaration',              # Scala object/companion
+        'record_declaration',
+    }
+    # Типы узлов для функций/методов
+    FUNCTION_TYPES = {
+        'function_declaration', 'function_definition', 'function_item',
+        'method_declaration', 'method_definition',
+        'constructor_declaration',
+        'arrow_function',                   # JS/TS — только верхний уровень
+        'function_signature',
+    }
+
+    ntype = node.type
+
+    if ntype in CONTAINER_TYPES and depth <= 2:
+        # Найти имя
+        name_node = node.child_by_field_name('name')
+        name = _ts_node_text(name_node, source) if name_node else '?'
+        container = {'kind': ntype.split('_')[0], 'name': name, 'methods': []}
+        results.append(container)
+        if gear <= 2:
+            # Рекурсивно собираем методы внутри
+            for child in node.children:
+                _collect_ts_items(child, source, gear, container['methods'], depth + 1)
+        return
+
+    if ntype in FUNCTION_TYPES:
+        name_node = node.child_by_field_name('name')
+        params_node = node.child_by_field_name('parameters')
+        name = _ts_node_text(name_node, source) if name_node else '?'
+        params = _ts_node_text(params_node, source) if params_node else ''
+
+        # Пропускаем приватные методы в gear 2
+        if gear >= 2 and name.startswith('_') and not name.startswith('__'):
+            return
+
+        if gear == 1:
+            sig = f'{name}{params}'
+        else:
+            sig = f'{name}()'
+        if isinstance(results, list) and results and isinstance(results[-1], dict):
+            # Мы внутри контейнера — results это container['methods']
+            results.append(sig)
+        else:
+            # Верхнеуровневая функция
+            results.append({'kind': 'function', 'name': name, 'methods': [sig] if gear == 1 else []})
+        return
+
+    # Рекурсия для всех остальных узлов
+    for child in node.children:
+        _collect_ts_items(child, source, gear, results, depth)
+
+
+def parse_via_treesitter(file_path: Path, gear: int) -> list[dict] | None:
+    """
+    Парсит файл через tree-sitter. Возвращает список типов в том же формате,
+    что и regex-парсеры, или None если язык/пакет недоступен.
+    """
+    if not _TREESITTER_AVAILABLE:
+        return None
+
+    lang_name = _TS_LANG_MAP.get(file_path.suffix)
+    if not lang_name:
+        return None
+
+    language = _load_ts_language(lang_name)
+    if language is None:
+        return None
+
+    try:
+        from tree_sitter import Parser
+        source = file_path.read_bytes()
+        parser = Parser(language)
+        tree = parser.parse(source)
+        results: list[dict] = []
+        _collect_ts_items(tree.root_node, source, gear, results, depth=0)
+        return results if results else []
+    except Exception:
+        return None
 # ШЕСТЕРНИ (gear system, идея из PocketCoder)
 # ─────────────────────────────────────────
 # Gear 1 (малый проект, < 30 файлов):
@@ -220,11 +389,24 @@ def parse_xml_config(content: str, gear: int) -> list[dict]:
 
 PARSERS = {
     '.java': parse_java,
-    '.kt': parse_java,       # Kotlin — близок к Java
+    '.kt': parse_java,       # Kotlin — regex-fallback; tree-sitter предпочтительнее
     '.py': parse_python,
     '.go': parse_go,
     '.xml': parse_xml_config,
 }
+
+# Расширения, которые понимает tree-sitter (но нет regex-парсера).
+# Используются в collect_files, чтобы собирать эти файлы даже без tree-sitter
+# (при его наличии они распарсятся, при отсутствии — пропустятся в parse_file).
+_TS_ONLY_EXTENSIONS = {
+    '.ts', '.tsx', '.js', '.jsx', '.mjs',
+    '.rs', '.cs', '.swift', '.rb',
+    '.c', '.h', '.cpp', '.cc', '.cxx',
+    '.scala', '.php', '.dart', '.lua',
+}
+
+# Все расширения, которые мы собираем (regex + tree-sitter-only)
+_ALL_EXTENSIONS = set(PARSERS.keys()) | _TS_ONLY_EXTENSIONS
 
 
 # ─────────────────────────────────────────
@@ -242,7 +424,7 @@ def collect_files(root: Path) -> dict[str, list[Path]]:
             if fname in IGNORE_FILES:
                 continue
             p = Path(dirpath) / fname
-            if p.suffix in PARSERS:
+            if p.suffix in _ALL_EXTENSIONS:
                 rel = p.relative_to(root)
                 parent = str(rel.parent) if rel.parent != Path('.') else '.'
                 tree[parent].append(p)
@@ -296,15 +478,28 @@ def save_cache(cache_path: Path, cache: dict) -> None:
     cache_path.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding='utf-8')
 
 
-def parse_file(file_path: Path, gear: int) -> list[dict] | None:
-    """Парсит один файл, возвращает список типов или None если неподдерживается."""
-    parser = PARSERS.get(file_path.suffix)
-    if not parser:
+def parse_file(file_path: Path, gear: int, use_ast: bool = True) -> list[dict] | None:
+    """Парсит один файл, возвращает список типов или None если неподдерживается.
+
+    Стратегия (приоритет):
+      1. Tree-sitter (если use_ast=True и пакеты установлены) — покрывает 31+ язык.
+      2. Regex-fallback — Python, Java, Go, Kotlin, XML (без зависимостей).
+      3. None — файл не поддерживается ни одним методом.
+    """
+    # Шаг 1: попытка через tree-sitter
+    if use_ast:
+        ts_result = parse_via_treesitter(file_path, gear)
+        if ts_result is not None:
+            return ts_result
+
+    # Шаг 2: regex-fallback (только для языков с парсером)
+    regex_parser = PARSERS.get(file_path.suffix)
+    if not regex_parser:
         return None
     content = _safe_read(file_path)
     if not content:
         return None
-    return parser(content, gear)
+    return regex_parser(content, gear)
 
 
 def render_file_types(file_name: str, types: list[dict], gear: int) -> list[str]:
@@ -448,7 +643,20 @@ def main():
     parser.add_argument('--max-files', type=int, default=500, help='Максимум файлов для анализа')
     parser.add_argument('--incremental', action='store_true',
                         help='Инкрементальный режим: перепарсить только изменённые файлы по mtime')
+    parser.add_argument('--no-ast', action='store_true',
+                        help='Отключить tree-sitter, использовать только regex-парсеры')
     args = parser.parse_args()
+
+    # Определяем, использовать ли tree-sitter
+    use_ast = not args.no_ast
+    if use_ast and not _TREESITTER_AVAILABLE:
+        use_ast = False  # tree-sitter не установлен — тихий fallback на regex
+
+    # Сообщение о режиме парсинга
+    if use_ast:
+        print('Парсер: tree-sitter (с regex-fallback для неподдерживаемых языков)')
+    else:
+        print('Парсер: regex (tree-sitter недоступен или отключён через --no-ast)')
 
     # Определяем пути для анализа
     roots: list[tuple[str, Path]] = []
@@ -549,7 +757,7 @@ def main():
 
                 # Файл новый или изменился — перепарсить с локальным gear
                 local_gear = all_local_gears.get(parent, global_gear)
-                types = parse_file(file_path, local_gear) or []
+                types = parse_file(file_path, local_gear, use_ast=use_ast) or []
                 all_types[rel] = types
                 try:
                     mtime = file_path.stat().st_mtime
@@ -601,6 +809,8 @@ def main():
 - Gear 1 (полные сигнатуры): {gear_counts[1]} папок
 - Gear 2 (ключевые методы): {gear_counts[2]} папок  
 - Gear 3 (структура): {gear_counts[3]} папок
+
+**Парсер**: {'tree-sitter (с regex-fallback)' if use_ast else 'regex'}
 
 > ⚠️ Этот файл генерируется автоматически скриптом `scripts/repo-map.py`.
 > Не редактировать вручную — изменения будут перезаписаны.
